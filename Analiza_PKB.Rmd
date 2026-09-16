@@ -1,0 +1,940 @@
+---
+title: "Analiza ekonometryczna zależności między PKB Polski a wybranymi zmiennymi makroekonomicznymi"
+author: "Bartosz Kawalec, Anna Oleszko, Kacper Saj"
+lang: pl
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+    code_folding: show
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 5
+)
+options(scipen = 999)
+
+pakiety <- c("readxl", "dplyr", "tidyr", "ggplot2", "scales", "car", "lmtest", "tseries")
+brakujace <- pakiety[!vapply(pakiety, requireNamespace, logical(1), quietly = TRUE)]
+
+if (length(brakujace) > 0) {
+  polecenie_instalacji <- paste0(
+    "install.packages(c(",
+    paste(sprintf('"%s"', brakujace), collapse = ", "),
+    "))"
+  )
+  stop(
+    paste0(
+      "Brakuje wymaganych pakietów R: ", paste(brakujace, collapse = ", "),
+      ". Zainstaluj je jednorazowo poleceniem: ", polecenie_instalacji
+    )
+  )
+}
+
+invisible(lapply(pakiety, library, character.only = TRUE))
+
+input_rmd <- knitr::current_input(dir = TRUE)
+project_dir <- if (nzchar(input_rmd)) dirname(normalizePath(input_rmd)) else getwd()
+knitr::opts_knit$set(root.dir = project_dir)
+```
+
+# Wstęp
+
+Produkt krajowy brutto (PKB) jest jedną z podstawowych miar aktywności gospodarczej kraju. Oznacza wartość dóbr i usług finalnych wytworzonych w gospodarce w określonym czasie. W projekcie analizowany jest PKB Polski w latach 1998--2025 na podstawie danych rocznych.
+
+W danych dostępne są przede wszystkim zmienne odpowiadające **wydatkowemu ujęciu PKB**, czyli składniki popytu finalnego: spożycie prywatne, spożycie publiczne, akumulacja brutto, eksport oraz import. Wzór na PKB w ujęciu wydatkowym ma postać:
+
+\[
+PKB = C + I + G + X - M
+\]
+
+gdzie:
+
+- \(C\) -- spożycie prywatne, czyli wydatki gospodarstw domowych na dobra i usługi,
+- \(I\) -- inwestycje, w projekcie przybliżone przez akumulację brutto,
+- \(G\) -- spożycie publiczne, czyli wydatki sektora instytucji rządowych i samorządowych na dobra i usługi,
+- \(X\) -- eksport towarów i usług,
+- \(M\) -- import towarów i usług.
+
+Wzór ten jest punktem wyjścia do opisu ekonomicznego, ale **nie oznacza automatycznego narzucenia wszystkich tych zmiennych do modelu finalnego**. W modelu ekonometrycznym zmienne muszą zostać dobrane na podstawie zasad statystycznych i ekonometrycznych, między innymi zmienności, korelacji ze zmienną objaśnianą, współliniowości, istotności parametrów oraz kryteriów informacyjnych.
+
+
+# Cel projektu
+
+Celem projektu jest budowa, weryfikacja i interpretacja modelu ekonometrycznego opisującego poziom realnego PKB Polski. Analiza ma wskazać, które spośród dostępnych zmiennych są najsilniej związane ze zmiennością PKB w badanej próbie. Dobór zmiennych nie jest oparty wyłącznie na wzorze księgowym PKB, lecz na procedurze ekonometrycznej: eliminacji zmiennych quasi-stałych, metodzie Hellwiga, analizie istotności parametrów, kryteriach AIC/BIC oraz kontroli współliniowości VIF.
+
+> **Ważne ograniczenie interpretacyjne:** część zmiennych objaśniających (konsumpcja, inwestycje, eksport, import i wydatki publiczne) jest bezpośrednio powiązana z tożsamością rachunkową PKB. Z tego powodu bardzo wysokie dopasowanie modelu nie może być interpretowane jako dowód zależności przyczynowej. Projekt ma charakter opisowy i predykcyjny, a nie przyczynowy.
+
+# Wczytanie danych i utworzenie danych realnych
+
+Kod poniżej wczytuje dane z pliku `Dane_PKB.xlsx`, porządkuje nazwy zmiennych, a następnie wykorzystuje wskaźnik cen towarów i usług konsumpcyjnych do przeliczenia zmiennych pieniężnych z wartości nominalnych na realne w cenach stałych 2025 r. Jednocześnie wskaźnik cen jest traktowany jak zwykła zmienna objaśniająca-kandydatka: zostaje zapisany w zbiorze `dane_realne` i przechodzi takie same etapy doboru zmiennych jak pozostałe zmienne. Indeks cen oraz deflator pozostają wyłącznie wielkościami pomocniczymi.
+
+```{r dane-realne}
+plik <- file.path(project_dir, "Dane_PKB.xlsx")
+if (!file.exists(plik)) {
+  stop("Nie znaleziono pliku Dane_PKB.xlsx w tym samym folderze co plik .Rmd.")
+}
+
+raw <- readxl::read_excel(plik, col_names = FALSE)
+
+nazwy <- c(
+  "rok", "PKB", "spozycie_prywatne", "kurs_USD_PLN", "import", "eksport",
+  "wynagrodzenie_brutto", "CPI", "stopa_bezrobocia", "akumulacja_brutto",
+  "stopy_procentowe", "spozycie_publiczne"
+)
+
+if (ncol(raw) < length(nazwy) || nrow(raw) < 4) {
+  stop("Plik Dane_PKB.xlsx ma nieoczekiwaną strukturę.")
+}
+
+dane <- raw[-c(1, 2, nrow(raw)), seq_along(nazwy)]
+colnames(dane) <- nazwy
+
+dane <- dane %>%
+  mutate(across(everything(), ~ suppressWarnings(as.numeric(.x)))) %>%
+  filter(!is.na(rok)) %>%
+  arrange(rok)
+
+if (anyDuplicated(dane$rok)) {
+  stop("W danych występują zduplikowane lata.")
+}
+if (anyNA(dane)) {
+  stop("W danych występują braki lub wartości nienumeryczne w wierszach obserwacji.")
+}
+if (!all(diff(dane$rok) == 1)) {
+  warning("Szereg lat nie jest ciągły. Sprawdź dane źródłowe.")
+}
+if (!2025 %in% dane$rok) {
+  stop("Brak obserwacji dla 2025 r.; nie można zbudować indeksu cen z bazą 2025 = 100.")
+}
+
+# CPI jest wykorzystywane do przeliczenia wartości nominalnych na wartości realne,
+# ale jednocześnie pozostaje normalną zmienną-kandydatką do modelu.
+# Indeks cen i deflator są wyłącznie pomocnicze.
+dane_desc <- dane %>% arrange(desc(rok))
+dane_desc$indeks_cen_2025 <- NA_real_
+dane_desc$indeks_cen_2025[dane_desc$rok == 2025] <- 100
+
+start_2025 <- which(dane_desc$rok == 2025)
+if (length(start_2025) != 1) {
+  stop("Rok 2025 musi występować dokładnie raz.")
+}
+
+if (start_2025 < nrow(dane_desc)) {
+  for (i in seq.int(start_2025, nrow(dane_desc) - 1)) {
+    dane_desc$indeks_cen_2025[i + 1] <-
+      dane_desc$indeks_cen_2025[i] / (dane_desc$CPI[i] / 100)
+  }
+}
+
+dane <- dane_desc %>%
+  arrange(rok) %>%
+  mutate(deflator_2025 = 100 / indeks_cen_2025)
+
+zmienne_pieniezne <- c(
+  "PKB", "spozycie_prywatne", "import", "eksport",
+  "wynagrodzenie_brutto", "akumulacja_brutto", "spozycie_publiczne"
+)
+
+for(zm in zmienne_pieniezne){
+  dane[[paste0(zm, "_real")]] <- dane[[zm]] * dane$deflator_2025
+}
+
+# Właściwy zbiór do analizy zawiera zmienne realne, zmienne makroekonomiczne
+# niewymagające deflowania 
+# Nie zawiera indeksu cen ani deflatora jako zmiennych analitycznych.
+dane_realne <- dane %>%
+  select(
+    rok,
+    PKB_real,
+    spozycie_prywatne_real,
+    kurs_USD_PLN,
+    import_real,
+    eksport_real,
+    wynagrodzenie_brutto_real,
+    CPI,
+    stopa_bezrobocia,
+    akumulacja_brutto_real,
+    stopy_procentowe,
+    spozycie_publiczne_real
+  )
+
+metodyka <- data.frame(
+  element = c(
+    "Rok bazowy",
+    "Sposób przeliczenia",
+    "Zmienne deflowane",
+    "Zmienne bez deflowania",
+    "Status CPI",
+    "Uwaga dotycząca indeksu cen i deflatora"
+  ),
+  opis = c(
+    "2025 = 100",
+    "wartość realna = wartość nominalna * deflator_2025",
+    paste(zmienne_pieniezne, collapse = ", "),
+    "kurs USD/PLN, CPI, stopa bezrobocia, stopy procentowe",
+    "CPI jest używane do obliczenia indeksu cen i deflatora, ale w projekcie pozostaje normalną zmienną-kandydatką do modelu.",
+    "Indeks cen i deflator służą wyłącznie do obliczenia wartości realnych. Nie są zmiennymi-kandydatkami i nie są sprawdzane w procedurze doboru zmiennych."
+  )
+)
+
+head(dane_realne)
+```
+
+## Kontrola jakości danych
+
+Przed estymacją sprawdzono kompletność danych, unikalność lat oraz zakres próby.
+
+```{r kontrola-danych}
+data.frame(
+  liczba_obserwacji = nrow(dane_realne),
+  rok_od = min(dane_realne$rok),
+  rok_do = max(dane_realne$rok),
+  liczba_brakow = sum(is.na(dane_realne)),
+  liczba_duplikatow_lat = sum(duplicated(dane_realne$rok))
+)
+```
+
+# Opis źródeł danych i zmiennych
+
+Dane wykorzystane w projekcie zostały zebrane do arkusza `Dane_PKB.xlsx`. Zmienna objaśniana to realny PKB Polski, natomiast zmienne objaśniające obejmują składniki popytu finalnego oraz wybrane wskaźniki makroekonomiczne. Wartości nominalne zmiennych pieniężnych zostały przeliczone na wartości realne w cenach stałych 2025 r. Wskaźnik CPI pozostaje równocześnie zmienną-kandydatką i przechodzi, razem z pozostałymi zmiennymi, eliminację quasi-stałych, analizę korelacji, metodę Hellwiga oraz dalsze etapy wyboru modelu. Indeks cen i deflator są natomiast wyłącznie wielkościami pomocniczymi używanymi do przeliczenia danych nominalnych na realne.
+
+
+**Y -- PKB realny**  
+Jednostka: mln zł, ceny stałe 2025 r.  
+Uzasadnienie: PKB jest miarą wartości dóbr i usług finalnych wytworzonych w gospodarce. W projekcie stanowi zmienną objaśnianą.
+
+**X1 -- spożycie prywatne realne**  
+Jednostka: mln zł, ceny stałe 2025 r.  
+Uzasadnienie: Spożycie prywatne oznacza wydatki gospodarstw domowych na dobra i usługi. Może wpływać na PKB przez popyt konsumpcyjny.
+
+**X2 -- kurs walutowy USD/PLN**  
+Jednostka: zł za 1 USD.  
+Uzasadnienie: Kurs walutowy wpływa na ceny importu i eksportu, konkurencyjność handlu zagranicznego oraz koszty transakcji międzynarodowych.
+
+**X3 -- import towarów i usług realny**  
+Jednostka: mln zł, ceny stałe 2025 r.  
+Uzasadnienie: Import jest składnikiem odejmowanym w rachunku PKB, ale empirycznie może rosnąć razem z aktywnością gospodarczą.
+
+**X4 -- eksport towarów i usług realny**  
+Jednostka: mln zł, ceny stałe 2025 r.  
+Uzasadnienie: Eksport zwiększa popyt na krajową produkcję i może dodatnio wpływać na PKB.
+
+**X5 -- roczne wynagrodzenie brutto realne**  
+Jednostka: zł, ceny stałe 2025 r.  
+Uzasadnienie: Wynagrodzenia wpływają na dochody gospodarstw domowych i ich zdolność do konsumpcji.
+
+**X6 -- wskaźnik cen towarów i usług konsumpcyjnych (CPI)**  
+Jednostka: indeks, rok poprzedni = 100.  
+Uzasadnienie: Wskaźnik cen towarów i usług konsumpcyjnych pokazuje zmianę przeciętnego poziomu cen dóbr i usług konsumpcyjnych. W projekcie pełni dwie funkcje: po pierwsze pomaga przeliczyć wartości nominalne na realne, a po drugie jest normalną zmienną-kandydatką do modelu, ponieważ inflacja może wpływać na aktywność gospodarczą, realną siłę nabywczą dochodów, konsumpcję, inwestycje oraz decyzje banku centralnego.
+
+**X7 -- stopa bezrobocia**  
+Jednostka: %.  
+Uzasadnienie: Stopa bezrobocia odzwierciedla sytuację na rynku pracy. Wyższe bezrobocie zwykle ogranicza dochody gospodarstw domowych oraz popyt konsumpcyjny.
+
+**X8 -- akumulacja brutto realna**  
+Jednostka: mln zł, ceny stałe 2025 r.  
+Uzasadnienie: Akumulacja brutto jest przybliżeniem inwestycji. Inwestycje zwiększają potencjał produkcyjny gospodarki i mogą wpływać na wzrost PKB.
+
+**X9 -- stopy procentowe referencyjne**  
+Jednostka: %.  
+Uzasadnienie: Stopy procentowe wpływają na koszt kredytu, inwestycje, konsumpcję oraz decyzje przedsiębiorstw i gospodarstw domowych.
+
+**X10 -- spożycie publiczne realne**  
+Jednostka: mln zł, ceny stałe 2025 r.  
+Uzasadnienie: Spożycie publiczne obejmuje wydatki sektora instytucji rządowych i samorządowych na dobra i usługi. Jest składnikiem popytu finalnego, ale jego obecność w modelu finalnym zależy od wyników doboru zmiennych.
+
+**indeks cen i deflator**  
+Indeks cen oraz deflator nie są zmiennymi objaśniającymi w tym projekcie. Zostały wykorzystane wyłącznie do przeliczenia wartości nominalnych na wartości realne w cenach stałych 2025 r. Nie są one włączane do zbioru zmiennych-kandydatek, nie przechodzą eliminacji quasi-stałych, metody Hellwiga ani dalszych etapów wyboru modelu. Inaczej traktowany jest wskaźnik CPI, który pozostaje w zbiorze danych jako normalna zmienna-kandydatka.
+
+# Analiza zmian zmiennych w czasie
+
+```{r wykres-pkb-realny, fig.height=5.5}
+dane_realne %>%
+  ggplot(aes(x = rok, y = PKB_real)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  scale_y_continuous(labels = scales::label_number(big.mark = " ", decimal.mark = ",")) +
+  labs(
+    title = "Realny PKB Polski w czasie",
+    x = "Rok",
+    y = "PKB realny, mln zl, ceny stale 2025 r."
+  ) +
+  theme_minimal()
+```
+
+```{r wykresy-pieniezne, fig.height=8}
+dane_realne %>%
+  select(rok, spozycie_prywatne_real, import_real, eksport_real, akumulacja_brutto_real, spozycie_publiczne_real) %>%
+  pivot_longer(-rok, names_to = "zmienna", values_to = "wartosc") %>%
+  ggplot(aes(x = rok, y = wartosc)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.6) +
+  facet_wrap(~ zmienna, scales = "free_y", ncol = 2) +
+  scale_y_continuous(labels = scales::label_number(big.mark = " ", decimal.mark = ",")) +
+  labs(title = "Realne zmienne pieniezne w czasie", x = "Rok", y = "Wartosc realna, mln zl") +
+  theme_minimal()
+```
+
+```{r wykresy-makro, fig.height=7}
+dane_realne %>%
+  select(rok, kurs_USD_PLN, wynagrodzenie_brutto_real, CPI, stopa_bezrobocia, stopy_procentowe) %>%
+  pivot_longer(-rok, names_to = "zmienna", values_to = "wartosc") %>%
+  ggplot(aes(x = rok, y = wartosc)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.6) +
+  facet_wrap(~ zmienna, scales = "free_y", ncol = 2) +
+  scale_y_continuous(labels = scales::label_number(big.mark = " ", decimal.mark = ",")) +
+  labs(title = "Pozostale zmienne makroekonomiczne w czasie", x = "Rok", y = "Wartosc") +
+  theme_minimal()
+```
+
+# Analiza doboru zmiennych
+
+Dobór zmiennych przeprowadzono według zasad ekonometrycznych. Wzór \(PKB = C + I + G + X - M\) wskazuje sens ekonomiczny części zmiennych, ale nie przesądza, że wszystkie muszą znaleźć się w modelu finalnym. Model finalny powinien spełniać kryteria statystyczne i diagnostyczne.
+
+## Eliminacja zmiennych quasi-stałych
+
+W pierwszym etapie obliczono współczynnik zmienności:
+
+\[
+V = \frac{S}{\bar{x}} \cdot 100\%
+\]
+
+gdzie \(S\) oznacza odchylenie standardowe, a \(\bar{x}\) średnią arytmetyczną. Zmienne o bardzo niskiej zmienności nie wnoszą dużo informacji do modelu, dlatego przyjęto próg eliminacji \(V < 10\%\).
+
+```{r quasi-stale}
+zmienne_x <- dane_realne %>%
+  select(-rok, -PKB_real)
+
+wsp_zmiennosci <- data.frame(
+  zmienna = names(zmienne_x),
+  srednia = sapply(zmienne_x, mean, na.rm = TRUE),
+  odchylenie = sapply(zmienne_x, sd, na.rm = TRUE)
+) %>%
+  mutate(V_proc = odchylenie / abs(srednia) * 100,
+         decyzja = ifelse(V_proc < 10, "odrzucić jako quasi-stałą", "pozostawić"))
+
+wsp_zmiennosci
+```
+
+Po tym etapie do dalszej analizy przechodzą tylko zmienne, które mają wystarczającą zmienność. Zmienna może być ważna ekonomicznie, ale jeśli w badanej próbie prawie się nie zmienia, to model regresji ma zbyt mało informacji, aby wiarygodnie oszacować jej wpływ.
+
+```{r zbior-po-quasi}
+zmienne_do_analizy <- wsp_zmiennosci %>%
+  filter(decyzja == "pozostawić") %>%
+  pull(zmienna)
+
+zmienne_do_analizy
+```
+
+## Korelacja ze zmienną objaśnianą
+
+Następnie sprawdzono korelację potencjalnych zmiennych objaśniających z realnym PKB. Wysoka korelacja ze zmienną objaśnianą może oznaczać dużą przydatność zmiennej, ale nie wystarcza do wyboru modelu, ponieważ zmienne objaśniające mogą być jednocześnie silnie skorelowane między sobą.
+
+```{r korelacje-z-y}
+korelacje_z_y <- sapply(zmienne_do_analizy, function(zm){
+  cor(dane_realne$PKB_real, dane_realne[[zm]], use = "complete.obs")
+})
+
+data.frame(
+  zmienna = names(korelacje_z_y),
+  korelacja_z_PKB = as.numeric(korelacje_z_y),
+  abs_korelacja = abs(as.numeric(korelacje_z_y))
+) %>% arrange(desc(abs_korelacja))
+```
+
+## Metoda Hellwiga
+
+Metoda Hellwiga wybiera taki zestaw zmiennych, który ma wysoką korelację ze zmienną objaśnianą, a jednocześnie ogranicza nadmierną korelację między zmiennymi objaśniającymi. Wartość wskaźnika pojemności informacyjnej jest wyższa, gdy zestaw zmiennych dobrze opisuje zmienną \(Y\), ale nie powiela tej samej informacji.
+
+```{r hellwig}
+hellwig_value <- function(data, y, zestaw){
+  podzbior <- data[, c(y, zestaw)]
+  R <- cor(podzbior, use = "complete.obs")
+  r_yx <- abs(R[y, zestaw])
+  R_xx <- abs(R[zestaw, zestaw, drop = FALSE])
+  sum((r_yx^2) / colSums(R_xx))
+}
+
+hellwig <- function(data, y, xvars) {
+  if (length(xvars) == 0) {
+    return(data.frame())
+  }
+
+  wyniki <- list()
+  licznik <- 1
+
+  for (k in seq_along(xvars)) {
+    kombinacje <- combn(xvars, k, simplify = FALSE)
+    for (zestaw in kombinacje) {
+      wyniki[[licznik]] <- data.frame(
+        zmienne = paste(zestaw, collapse = ", "),
+        liczba_zmiennych = length(zestaw),
+        hellwig_H = hellwig_value(data, y, zestaw)
+      )
+      licznik <- licznik + 1
+    }
+  }
+
+  bind_rows(wyniki) %>% arrange(desc(hellwig_H))
+}
+
+if (length(zmienne_do_analizy) == 0) {
+  stop("Po eliminacji zmiennych quasi-stałych nie pozostała żadna zmienna do analizy.")
+}
+
+wyniki_hellwig <- hellwig(dane_realne, "PKB_real", zmienne_do_analizy)
+head(wyniki_hellwig, 10)
+```
+
+## Wybór modelu finalnego
+
+W tym projekcie model finalny jest wybierany automatycznie spośród wszystkich kombinacji zmiennych, które przeszły etap eliminacji quasi-stałych. Przyjęto następujące kryteria:
+
+- liczba zmiennych w modelu: od 3 do 5, aby model nie był zbyt ubogi, ale też nie był przeparametryzowany przy 28 obserwacjach,
+- istotność parametrów: maksymalna wartość p-value dla zmiennych objaśniających nie większa niż 0,10; poziom 10% przyjęto ze względu na niewielką próbę roczną,
+- współliniowość: maksymalny VIF nie większy niż 10,
+- jakość dopasowania: możliwie wysokie skorygowane \(R^2\),
+- porównanie modeli: możliwie niskie AIC i BIC,
+- metoda Hellwiga: wysoka pojemność informacyjna zestawu zmiennych.
+
+Ostatecznie wybierany jest model spełniający warunki istotności i VIF, a następnie mający najniższą wartość AIC. Jeśli żaden model nie spełniłby wszystkich warunków, kod pokazuje najlepszy model kompromisowy i wymaga ostrożniejszej interpretacji.
+
+```{r wybor-modelu}
+max_vif <- function(model){
+  if(length(coef(model)) <= 2){
+    return(1)
+  }
+  wynik <- tryCatch(max(car::vif(model)), error = function(e) Inf)
+  as.numeric(wynik)
+}
+
+ocen_model <- function(zestaw){
+  form <- as.formula(paste("PKB_real ~", paste(zestaw, collapse = " + ")))
+  mod <- lm(form, data = dane_realne)
+  p_values <- summary(mod)$coefficients[-1, 4]
+  data.frame(
+    zmienne = paste(zestaw, collapse = ", "),
+    liczba_zmiennych = length(zestaw),
+    R2 = summary(mod)$r.squared,
+    R2_skorygowane = summary(mod)$adj.r.squared,
+    AIC = AIC(mod),
+    BIC = BIC(mod),
+    max_p_value = if (length(p_values)) max(p_values, na.rm = TRUE) else NA_real_,
+    max_VIF = max_vif(mod),
+    hellwig_H = hellwig_value(dane_realne, "PKB_real", zestaw),
+    model = I(list(mod)),
+    zmienne_lista = I(list(zestaw))
+  )
+}
+
+k_min <- min(3, length(zmienne_do_analizy))
+k_max <- min(5, length(zmienne_do_analizy))
+
+kombinacje_modeli <- unlist(
+  lapply(seq.int(k_min, k_max), function(k) {
+    combn(zmienne_do_analizy, k, simplify = FALSE)
+  }),
+  recursive = FALSE
+)
+
+ranking_modeli <- bind_rows(lapply(kombinacje_modeli, ocen_model)) %>%
+  arrange(AIC, BIC, desc(R2_skorygowane))
+
+modele_dopuszczalne <- ranking_modeli %>%
+  filter(max_p_value <= 0.10, max_VIF <= 10)
+
+if(nrow(modele_dopuszczalne) > 0){
+  wybor <- modele_dopuszczalne[1, ]
+  powod_wyboru <- "Wybrano model o najniższym AIC spośród modeli spełniających warunek istotności parametrów i VIF."
+} else {
+  wybor <- ranking_modeli[1, ]
+  powod_wyboru <- "Żaden model nie spełnił jednocześnie wszystkich kryteriów, dlatego wybrano najlepszy model według AIC i oznaczono go jako kompromisowy."
+}
+
+ranking_modeli %>% select(-model, -zmienne_lista) %>% head(10)
+```
+
+```{r model-finalny}
+model <- wybor$model[[1]]
+zmienne_finalne <- wybor$zmienne_lista[[1]]
+
+powod_wyboru
+zmienne_finalne
+summary(model)
+```
+
+Zmienna, która nie znalazła się w modelu finalnym, nie jest uznawana za nieistotną ekonomicznie w ogóle. Oznacza to jedynie, że w badanej próbie, po uwzględnieniu pozostałych zmiennych, nie poprawiała jakości modelu w stopniu wystarczającym według przyjętych kryteriów ekonometrycznych.
+
+# Estymacja parametrów
+
+Model finalny ma ogólną postać:
+
+\[
+PKB_t = a_0 + a_1X_{1t} + a_2X_{2t} + \ldots + a_kX_{kt} + \varepsilon_t
+\]
+
+gdzie \(X_1, X_2, \ldots, X_k\) oznaczają zmienne wybrane do modelu na podstawie procedury doboru zmiennych, a \(\varepsilon_t\) jest składnikiem losowym.
+
+```{r estymacja}
+summary(model)
+coef(model)
+```
+
+# Weryfikacja modelu
+
+Weryfikacja modelu ma na celu sprawdzenie, czy model jest dobrze dopasowany do danych, czy parametry są istotne, czy nie występuje zbyt silna współliniowość oraz czy znaki parametrów są możliwe do uzasadnienia ekonomicznego.
+
+## Miary dopasowania SST, SSR i SSE
+
+Całkowita suma kwadratów \(SST\) pokazuje całkowitą zmienność zmiennej objaśnianej. Suma kwadratów regresji \(SSR\) pokazuje część zmienności wyjaśnioną przez model. Suma kwadratów reszt \(SSE\) pokazuje część niewyjaśnioną przez model. Im większy udział \(SSR\) w \(SST\), tym lepsze dopasowanie modelu.
+
+```{r sst-ssr-sse}
+y <- model.response(model.frame(model))
+y_hat <- fitted(model)
+e <- residuals(model)
+SST <- sum((y - mean(y))^2)
+SSE <- sum(e^2)
+SSR <- sum((y_hat - mean(y))^2)
+miary_dopasowania <- data.frame(
+  SST = SST,
+  SSR = SSR,
+  SSE = SSE,
+  udzial_wyjasniony = SSR / SST,
+  udzial_niewyjasniony = SSE / SST,
+  R2 = summary(model)$r.squared,
+  R2_skorygowane = summary(model)$adj.r.squared
+)
+miary_dopasowania
+```
+
+Jeżeli \(SSE\) jest niewielkie względem \(SST\), oznacza to, że reszty modelu są relatywnie małe, a model dobrze odtwarza zmienność realnego PKB.
+
+## Współczynnik determinacji i współczynnik zbieżności
+
+Współczynnik determinacji \(R^2\) informuje, jaka część zmienności realnego PKB została wyjaśniona przez model. Skorygowane \(R^2\) uwzględnia liczbę zmiennych objaśniających, dlatego jest bardziej odpowiednie do porównywania modeli o różnej liczbie zmiennych. Współczynnik zbieżności \(\varphi^2 = 1 - R^2\) pokazuje część zmienności niewyjaśnionej przez model.
+
+```{r r2-phi}
+R2 <- summary(model)$r.squared
+R2_adj <- summary(model)$adj.r.squared
+phi2 <- 1 - R2
+data.frame(R2 = R2, R2_skorygowane = R2_adj, wspolczynnik_zbieznosci_phi2 = phi2)
+```
+
+## Test istotności całego modelu -- test F
+
+Test F sprawdza, czy model jako całość jest statystycznie istotny.
+
+Hipotezy:
+
+\[
+H_0: a_1 = a_2 = \ldots = a_k = 0
+\]
+
+\[
+H_1: \text{co najmniej jeden parametr przy zmiennej objaśniającej jest różny od zera}
+\]
+
+Jeżeli p-value testu F jest mniejsze od poziomu istotności \(\alpha = 0{,}05\), odrzucamy hipotezę zerową i uznajemy, że model jako całość jest istotny.
+
+```{r test-f}
+f_stat <- summary(model)$fstatistic
+p_value_F <- pf(f_stat[1], f_stat[2], f_stat[3], lower.tail = FALSE)
+data.frame(
+  F = as.numeric(f_stat[1]),
+  df1 = as.numeric(f_stat[2]),
+  df2 = as.numeric(f_stat[3]),
+  p_value = p_value_F,
+  decyzja = ifelse(p_value_F < 0.05, "model istotny statystycznie", "brak podstaw do uznania modelu za istotny")
+)
+```
+
+## Test istotności parametrów -- test t-Studenta
+
+Test t-Studenta sprawdza istotność każdej zmiennej osobno. Dla każdego parametru testowane są hipotezy:
+
+\[
+H_0: a_i = 0
+\]
+
+\[
+H_1: a_i \neq 0
+\]
+
+Jeżeli p-value jest mniejsze od przyjętego poziomu istotności, zmienna jest statystycznie istotna. W doborze modelu dopuszczono poziom 10%, natomiast przy interpretacji klasycznej dodatkowo zwracamy uwagę na poziom 5%.
+
+```{r test-t}
+wspolczynniki <- as.data.frame(summary(model)$coefficients)
+wspolczynniki$zmienna <- rownames(wspolczynniki)
+rownames(wspolczynniki) <- NULL
+wspolczynniki <- wspolczynniki %>%
+  rename(
+    oszacowanie = Estimate,
+    blad_standardowy = `Std. Error`,
+    statystyka_t = `t value`,
+    p_value = `Pr(>|t|)`
+  ) %>%
+  mutate(
+    istotnosc_5proc = ifelse(p_value < 0.05, "istotna", "nieistotna przy 5%"),
+    istotnosc_10proc = ifelse(p_value < 0.10, "istotna", "nieistotna przy 10%")
+  )
+wspolczynniki
+```
+
+## Błędy oszacowania parametrów i przedziały ufności
+
+Błąd standardowy informuje, jak precyzyjnie oszacowano parametr. Im mniejszy błąd standardowy względem wartości parametru, tym bardziej stabilne oszacowanie. Przedział ufności pokazuje zakres wartości, w którym z określonym prawdopodobieństwem może znajdować się prawdziwa wartość parametru. Jeżeli przedział ufności dla parametru nie obejmuje zera, przemawia to za istotnością zmiennej.
+
+```{r bledy-parametrow}
+przedzialy_ufnosci <- as.data.frame(confint(model))
+przedzialy_ufnosci$zmienna <- rownames(przedzialy_ufnosci)
+rownames(przedzialy_ufnosci) <- NULL
+przedzialy_ufnosci
+```
+
+## Wyrazistość modelu
+
+Współczynnik wyrazistości modelu określa, jak duży jest typowy błąd modelu w relacji do średniej wartości zmiennej objaśnianej:
+
+\[
+V_e = \frac{S_e}{\bar{y}} \cdot 100\%
+\]
+
+Niższa wartość oznacza lepszą wyrazistość modelu. W praktyce często przyjmuje się, że wynik poniżej 10--15% oznacza dobry model, a wynik poniżej 30% jest jeszcze akceptowalny.
+
+```{r wyrazistosc}
+Se <- sqrt(sum(residuals(model)^2) / df.residual(model))
+Ve <- Se / mean(dane_realne$PKB_real) * 100
+data.frame(
+  odchylenie_standardowe_reszt = Se,
+  srednia_PKB = mean(dane_realne$PKB_real),
+  V_proc = Ve,
+  interpretacja = ifelse(Ve < 10, "bardzo dobra wyrazistość", ifelse(Ve < 30, "akceptowalna wyrazistość", "słaba wyrazistość"))
+)
+```
+
+## Współliniowość -- VIF
+
+Współczynnik VIF sprawdza, czy dana zmienna objaśniająca jest silnie powiązana z pozostałymi zmiennymi w modelu. Wysoka współliniowość utrudnia interpretację pojedynczych parametrów i może zwiększać ich błędy standardowe.
+
+Interpretacja:
+
+- VIF około 1 -- brak problemu współliniowości,
+- VIF od 1 do 5 -- umiarkowana współliniowość,
+- VIF od 5 do 10 -- podwyższona, ale często jeszcze akceptowalna współliniowość,
+- VIF powyżej 10 -- silna współliniowość, model wymaga korekty.
+
+```{r vif}
+if(length(coef(model)) > 2){
+  vif_wyniki <- car::vif(model)
+} else {
+  vif_wyniki <- c("model z jedną zmienną" = 1)
+}
+vif_wyniki
+```
+
+## Koincydencja znaków
+
+Koincydencja znaków polega na porównaniu znaku korelacji zmiennej objaśniającej z PKB oraz znaku parametru regresji. Jeżeli znak korelacji i znak parametru są sprzeczne, może to oznaczać problem współliniowości albo wpływ innych zmiennych w modelu. Nie zawsze jest to błąd, ale wymaga komentarza ekonomicznego.
+
+```{r koincydencja}
+korelacje_finalne <- sapply(zmienne_finalne, function(zm){
+  cor(dane_realne$PKB_real, dane_realne[[zm]], use = "complete.obs")
+})
+parametry_finalne <- coef(model)[zmienne_finalne]
+
+data.frame(
+  zmienna = zmienne_finalne,
+  korelacja_z_PKB = as.numeric(korelacje_finalne),
+  znak_korelacji = sign(korelacje_finalne),
+  parametr_modelu = as.numeric(parametry_finalne),
+  znak_parametru = sign(parametry_finalne),
+  zgodnosc_znakow = ifelse(sign(korelacje_finalne) == sign(parametry_finalne), "zgodne", "niezgodne - wymaga komentarza")
+)
+```
+
+## Kryteria informacyjne AIC i BIC
+
+AIC i BIC służą do porównywania modeli. Niższa wartość oznacza korzystniejszy kompromis między dopasowaniem modelu a liczbą parametrów. BIC silniej karze zbyt dużą liczbę zmiennych niż AIC.
+
+```{r aic-bic}
+data.frame(AIC = AIC(model), BIC = BIC(model))
+```
+
+# Testy założeń modelu
+
+Testy założeń modelu pozwalają sprawdzić, czy klasyczny model regresji liniowej może być wiarygodnie interpretowany. Szczególnie ważne są: normalność reszt, stałość wariancji reszt, brak autokorelacji oraz poprawna postać funkcyjna modelu.
+
+## Badanie symetrii reszt
+
+Badanie symetrii sprawdza, czy liczba reszt dodatnich i ujemnych jest zbliżona. Jeżeli reszty są silnie niesymetryczne, model może systematycznie zawyżać albo zaniżać wartości PKB.
+
+Hipotezy:
+
+\[
+H_0: \text{udział reszt dodatnich wynosi } 0{,}5
+\]
+
+\[
+H_1: \text{udział reszt dodatnich różni się od } 0{,}5
+\]
+
+```{r symetria-reszt}
+reszty <- residuals(model)
+reszty_bez_zera <- reszty[reszty != 0]
+n_sym <- length(reszty_bez_zera)
+m_sym <- sum(reszty_bez_zera > 0)
+
+test_znakow <- binom.test(m_sym, n_sym, p = 0.5, alternative = "two.sided")
+
+data.frame(
+  n = n_sym,
+  dodatnie = m_sym,
+  ujemne = n_sym - m_sym,
+  udzial_dodatnich = m_sym / n_sym,
+  p_value = test_znakow$p.value,
+  decyzja = ifelse(
+    test_znakow$p.value > 0.05,
+    "brak podstaw do odrzucenia H0 o równym udziale znaków",
+    "odrzucenie H0 o równym udziale znaków"
+  )
+)
+```
+
+## Test serii
+
+Test serii sprawdza, czy znaki reszt układają się losowo. Jeżeli reszty dodatnie i ujemne tworzą długie bloki, może to oznaczać pominięcie trendu, autokorelację lub niepoprawną postać modelu.
+
+Hipotezy:
+
+\[
+H_0: \text{reszty są rozmieszczone losowo}
+\]
+
+\[
+H_1: \text{reszty nie są rozmieszczone losowo}
+\]
+
+```{r test-serii}
+reszty_runs <- reszty[reszty != 0]
+znaki_reszt <- factor(
+  ifelse(reszty_runs > 0, "plus", "minus"),
+  levels = c("minus", "plus")
+)
+
+if (length(unique(znaki_reszt)) == 2) {
+  test_serii <- tseries::runs.test(znaki_reszt)
+  test_serii
+} else {
+  cat("Test serii nie może zostać wykonany, ponieważ wszystkie niezerowe reszty mają ten sam znak.")
+}
+```
+
+Jeżeli p-value testu serii jest większe od 0,05, nie ma podstaw do odrzucenia hipotezy o losowym rozmieszczeniu reszt.
+
+## Normalność reszt -- test Shapiro-Wilka
+
+Test Shapiro-Wilka sprawdza, czy reszty modelu mają rozkład normalny. Normalność reszt jest ważna zwłaszcza dla poprawności wnioskowania w testach t i F przy małych próbach.
+
+Hipotezy:
+
+\[
+H_0: \text{reszty mają rozkład normalny}
+\]
+
+\[
+H_1: \text{reszty nie mają rozkładu normalnego}
+\]
+
+```{r shapiro}
+test_shapiro <- shapiro.test(residuals(model))
+test_shapiro
+```
+
+Jeżeli p-value jest większe od 0,05, nie ma podstaw do odrzucenia hipotezy o normalności reszt.
+
+## Heteroskedastyczność -- test Breuscha-Pagana
+
+Heteroskedastyczność oznacza, że wariancja reszt nie jest stała. Może to prowadzić do niepoprawnych błędów standardowych i błędnych wniosków o istotności parametrów.
+
+Hipotezy:
+
+\[
+H_0: \text{wariancja reszt jest stała, czyli występuje homoskedastyczność}
+\]
+
+\[
+H_1: \text{wariancja reszt nie jest stała, czyli występuje heteroskedastyczność}
+\]
+
+```{r bp}
+test_bp <- lmtest::bptest(model)
+test_bp
+```
+
+Jeżeli p-value jest większe od 0,05, nie ma podstaw do stwierdzenia heteroskedastyczności.
+
+## Autokorelacja reszt -- test Durbina-Watsona
+
+Test Durbina-Watsona sprawdza, czy reszty z kolejnych okresów są ze sobą powiązane. Jest to szczególnie ważne w danych rocznych, ponieważ zmienne makroekonomiczne często wykazują zależności w czasie.
+
+Hipotezy:
+
+\[
+H_0: \text{brak autokorelacji pierwszego rzędu}
+\]
+
+\[
+H_1: \text{występuje autokorelacja reszt}
+\]
+
+```{r durbin-watson}
+test_dw <- lmtest::dwtest(model)
+test_dw
+```
+
+Jeżeli p-value jest mniejsze od 0,05, oznacza to problem autokorelacji. W takim przypadku model może nadal dobrze opisywać zależności, ale klasyczne błędy standardowe mogą być obciążone.
+
+## Autokorelacja reszt -- test Ljunga-Boxa
+
+Test Ljunga-Boxa sprawdza, czy w resztach występuje autokorelacja dla kilku opóźnień jednocześnie. Jest uzupełnieniem testu Durbina-Watsona.
+
+Hipotezy:
+
+\[
+H_0: \text{brak autokorelacji reszt do wskazanego opóźnienia}
+\]
+
+\[
+H_1: \text{występuje autokorelacja reszt}
+\]
+
+```{r ljung-box}
+lag_lb <- min(5, max(1, floor(length(residuals(model)) / 5)))
+test_lb <- Box.test(
+  residuals(model),
+  lag = lag_lb,
+  type = "Ljung-Box",
+  fitdf = min(length(zmienne_finalne), lag_lb - 1)
+)
+test_lb
+```
+
+## Poprawność postaci funkcyjnej -- test RESET
+
+Test RESET sprawdza, czy liniowa postać modelu jest wystarczająca. Niska wartość p-value może sugerować, że model pomija istotne nieliniowości, interakcje lub ważne zmienne.
+
+Hipotezy:
+
+\[
+H_0: \text{postać funkcyjna modelu jest poprawna}
+\]
+
+\[
+H_1: \text{postać funkcyjna modelu jest niepoprawna}
+\]
+
+```{r reset}
+test_reset <- lmtest::resettest(model, power = 2:3, type = "fitted")
+test_reset
+```
+
+# Interpretacja modelu
+
+Model finalny został wybrany na podstawie procedury ekonometrycznej, a nie przez mechaniczne wpisanie wszystkich składników wzoru na PKB. Dzięki temu ograniczono ryzyko przeparametryzowania, współliniowości oraz włączenia zmiennych, które w badanej próbie nie poprawiają jakości modelu.
+
+```{r interpretacja-parametrow}
+interpretacja <- data.frame(
+  zmienna = names(coef(model))[-1],
+  parametr = coef(model)[-1]
+) %>%
+  mutate(
+    kierunek_wplywu = ifelse(parametr > 0, "dodatni", "ujemny")
+  )
+interpretacja
+```
+
+Dodatni parametr oznacza, że przy założeniu niezmienności pozostałych zmiennych wyższa wartość danej zmiennej jest w badanej próbie związana z wyższym realnym PKB. Ujemny parametr oznacza zależność odwrotną. Parametrów nie należy interpretować jako efektów przyczynowych. Przy interpretacji należy pamiętać, że model opiera się na danych makroekonomicznych w czasie, dlatego część zmiennych może mieć wspólny trend wzrostowy.
+
+# Zastosowanie modelu ekonometrycznego
+
+Model może zostać wykorzystany do:
+
+- oceny, które dostępne zmienne najlepiej objaśniają realny PKB Polski,
+- porównania znaczenia zmiennych popytowych i makroekonomicznych,
+- przygotowania prostego scenariusza trendowego PKB przy założeniu dalszego trendu zmian zmiennych objaśniających.
+
+# Scenariusz trendowy do 2030 roku
+
+Scenariusz przygotowano dla lat 2026--2030. Najpierw liniowo ekstrapolowano zmienne wybrane do modelu finalnego, a następnie podstawiono ich wartości do oszacowanego modelu PKB. Nie jest to pełna prognoza makroekonomiczna: wynik pokazuje wyłącznie, co wynikałoby z prostego przedłużenia dotychczasowych trendów i dlatego należy go traktować orientacyjnie.
+
+```{r prognoza}
+lata_prognozy <- data.frame(rok = 2026:2030)
+
+prognozuj_liniowo <- function(zmienna){
+  pomoc <- data.frame(rok = dane_realne$rok, wartosc = dane_realne[[zmienna]])
+  mod <- lm(wartosc ~ rok, data = pomoc)
+  as.numeric(predict(mod, newdata = lata_prognozy))
+}
+
+nowe_dane <- lata_prognozy
+for(zm in zmienne_finalne){
+  nowe_dane[[zm]] <- prognozuj_liniowo(zm)
+}
+
+prognoza_PKB <- nowe_dane %>%
+  mutate(PKB_real_prognoza = as.numeric(predict(model, newdata = nowe_dane)))
+
+prognoza_PKB
+```
+
+```{r wykres-prognoza, fig.height=6}
+historia <- dane_realne %>%
+  select(rok, PKB_real) %>%
+  mutate(typ = "dane historyczne") %>%
+  rename(PKB = PKB_real)
+
+prog <- prognoza_PKB %>%
+  select(rok, PKB_real_prognoza) %>%
+  mutate(typ = "prognoza") %>%
+  rename(PKB = PKB_real_prognoza)
+
+bind_rows(historia, prog) %>%
+  ggplot(aes(x = rok, y = PKB, linetype = typ)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.7) +
+  scale_y_continuous(labels = scales::label_number(big.mark = " ", decimal.mark = ",")) +
+  labs(title = "Realny PKB Polski -- dane historyczne i prognoza do 2030 r.", x = "Rok", y = "PKB realny, mln zł") +
+  theme_minimal()
+```
+
+# Podsumowanie
+
+Celem przeprowadzonej analizy było zbudowanie modelu ekonometrycznego opisującego zależność pomiędzy realnym PKB Polski a wybranymi zmiennymi makroekonomicznymi na podstawie danych rocznych z lat 1998–2025. Przed rozpoczęciem modelowania wartości nominalne zmiennych pieniężnych zostały przeliczone na ceny stałe 2025 r., co pozwoliło ograniczyć wpływ zmian poziomu cen i analizować zmiany wielkości ekonomicznych w ujęciu realnym. Indeks cen oraz deflator wykorzystano wyłącznie technicznie do przygotowania danych realnych, natomiast wskaźnik CPI pozostawiono jako jedną ze zmiennych kandydujących do modelu.
+
+Dobór zmiennych nie został oparty wyłącznie na tożsamości rachunkowej PKB. W analizie zastosowano wieloetapową procedurę obejmującą eliminację zmiennych quasi-stałych, analizę korelacji, metodę Hellwiga oraz porównanie alternatywnych specyfikacji modeli. Przy wyborze modelu finalnego uwzględniono również istotność statystyczną parametrów, poziom współliniowości mierzony współczynnikiem VIF, skorygowany współczynnik determinacji oraz kryteria informacyjne AIC i BIC. Pozwoliło to ograniczyć arbitralność doboru zmiennych oraz ryzyko utworzenia modelu nadmiernie rozbudowanego w stosunku do liczby dostępnych obserwacji.
+
+W wyniku zastosowanej procedury do modelu finalnego zakwalifikowano trzy zmienne objaśniające: **realne spożycie prywatne, realną akumulację brutto oraz stopy procentowe**. Spośród nich zdecydowanie najsilniejszą statystycznie zależność z realnym PKB wykazuje spożycie prywatne. Parametry przy akumulacji brutto i stopach procentowych są słabiej istotne i spełniają przyjęte w analizie kryterium istotności na poziomie 10%, ale nie na poziomie 5%. Oznacza to, że ich interpretacja powinna być bardziej ostrożna.
+
+Model charakteryzuje się bardzo wysokim dopasowaniem do danych. Współczynnik determinacji wynosi około **0,9965**, natomiast skorygowany współczynnik determinacji około **0,9961**. Oznacza to, że model odtwarza zdecydowaną większość zmienności realnego PKB obserwowanej w badanej próbie. Należy jednak pamiętać, że bardzo wysokie dopasowanie jest częściowo związane ze specyfiką analizowanych danych. Spożycie prywatne i akumulacja brutto są składnikami wydatkowego ujęcia PKB, dlatego ich silny związek z PKB ma również podstawę rachunkową. Wysoka wartość \(R^2\) nie może być zatem traktowana jako dowód występowania zależności przyczynowych.
+
+Przeprowadzona diagnostyka wskazuje ponadto, że model nie spełnia wszystkich klasycznych założeń w sposób bezproblemowy. Test Durbina–Watsona wskazuje na występowanie dodatniej autokorelacji reszt. Jest to szczególnie istotne w przypadku danych rocznych uporządkowanych w czasie, ponieważ oznacza, że błędy modelu w kolejnych okresach nie są w pełni niezależne. W konsekwencji klasyczne błędy standardowe oraz wnioski dotyczące istotności parametrów należy interpretować z odpowiednią ostrożnością.
+
+Dodatkowo wynik testu RESET na poziomie istotności 5% wskazuje, że istnieją przesłanki do zakwestionowania pełnej poprawności przyjętej liniowej postaci funkcyjnej modelu. Może to oznaczać, że część zależności ma charakter nieliniowy, w modelu pominięto istotne zmienne lub należałoby uwzględnić bardziej złożoną strukturę czasową. Nie przekreśla to wartości modelu jako narzędzia opisowego, ale ogranicza możliwość traktowania go jako kompletnego modelu strukturalnego polskiej gospodarki.
+
+Uzyskane wyniki pokazują przede wszystkim silną współzmienność realnego PKB ze spożyciem prywatnym oraz, w mniejszym stopniu, z akumulacją brutto i stopami procentowymi w analizowanym okresie. Nie należy jednak interpretować oszacowanych współczynników jako czystych efektów przyczynowych. Model opisuje zależności występujące w danych historycznych, a nie mechanizmy pozwalające stwierdzić, że zmiana jednej ze zmiennych objaśniających sama w sobie spowoduje określoną zmianę PKB.
+
+Przygotowany scenariusz trendowy do 2030 r. należy z tego samego powodu traktować jako **ekstrapolację opartą na historycznych zależnościach i trendach**, a nie pełną prognozę makroekonomiczną. Wartości przyszłe mogą być istotnie zmienione przez czynniki, których model nie uwzględnia, między innymi zmiany polityki gospodarczej, wahania koniunktury, szoki zewnętrzne czy zmiany strukturalne gospodarki.
+
+Podsumowując, przeprowadzona analiza pozwoliła zbudować stosunkowo prosty i bardzo dobrze dopasowany do próby model opisujący zależności pomiędzy realnym PKB Polski a wybranymi zmiennymi makroekonomicznymi. Jednocześnie wyniki diagnostyki pokazują, że wysoka jakość dopasowania nie jest wystarczającą podstawą do bezkrytycznego wykorzystania modelu do wnioskowania przyczynowego lub długookresowego prognozowania. Naturalnym kierunkiem dalszego rozwoju analizy byłoby uwzględnienie właściwości szeregu czasowego, przetestowanie alternatywnych postaci funkcyjnych oraz porównanie wyników z modelami uwzględniającymi dynamikę zmiennych w czasie.
+
+
